@@ -127,7 +127,7 @@ Detector Configuration
 Project/
 │
 ├── ct_detector_simulator.py
-├── run_detector_demo.py
+├── run_detector.py
 ├── ct_sinogram_simulation.py
 └── detector_sim_outputs/
     ├── all_detector_signals.npy
@@ -394,7 +394,7 @@ detector_sim_outputs/
 To test the baseline detector physics and generate metric plots:
 
 ```bash
-python run_detector_demo.py
+python run_detector.py
 
 ```
 
