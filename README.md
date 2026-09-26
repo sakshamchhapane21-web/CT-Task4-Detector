@@ -178,7 +178,7 @@ Calculates the zero-frequency Detective Quantum Efficiency based on exposure ($q
 
 ---
 
-# 6. `run_detector_demo.py`
+# 6. `run_detector.py`
 
 ## Purpose
 
