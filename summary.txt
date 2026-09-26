@@ -1,0 +1,30 @@
+CT Detector Simulator - Configuration Summary
+================================================
+Geometry:
+  Rows x Channels        : 64 x 888
+  Pixel pitch (W x H)    : 0.625 mm x 0.625 mm
+  Active area (W x H)    : 555.0 mm x 40.0 mm
+  Collimation            : 40.0 mm
+  Detector type          : energy_integrating
+
+Material: Generic Scintillator + Photodiode (GOS-like default)
+  Thickness              : 1.4 mm
+  Effective energy       : 65.0 keV
+  Quantum efficiency (eta): 0.8591 (85.91 %)
+  Swank factor            : 0.970
+  Conversion gain (g)     : 1716.0 e-/absorbed photon
+
+Electronics:
+  Electronic noise (sigma_e): 35.0 e- RMS
+  Full well capacity      : 2.50e+08 e-
+  ADC bit depth           : 16 bit
+
+Imperfections:
+  Dead pixels             : 114 (0.201 % of array)
+  Gain non-uniformity sig : 1.00 %
+  Fixed offset sigma      : 15.0 e-
+  Optical/charge spread   : 0.350 mm (1-sigma)
+
+Performance @ 1.00e+05 photons/pixel:
+  DQE(0)                  : 0.8334
+  Nyquist frequency       : 0.800 cy/mm
