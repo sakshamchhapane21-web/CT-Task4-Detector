@@ -1,36 +1,76 @@
+"""
+energy_integrating_detector.py
+==============================
+GPU-Accelerated Energy-Integrating Detector (EID) Module.
+
+Models the physical detection chain of a multi-row CT detector:
+  1. Scintillator X-ray Absorption & Quantum Detection Efficiency (QDE) eta(E)
+  2. Polychromatic Energy Integration: Deposited energy to electron conversion
+  3. Optical Scintillator Spread: 2D Point Spread Function (PSF) optical blur
+  4. Photo-Diode PRNU (Gain Non-Uniformity) & Defective Pixels
+  5. Quantum Poisson Noise & Electronic Readout Noise (sigma = 500 e-)
+
+Supports batched GPU arrays (B, H, W) via CuPy for real-time 16,728-view throughput.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+from typing import Any, Dict, Optional, Tuple, Union
+
 import numpy as np
-from scipy.ndimage import gaussian_filter
-import matplotlib.pyplot as plt
+
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import gaussian_filter as cupy_gaussian_filter
+    HAS_CUPY = True
+except ImportError:
+    import numpy as cp
+    from scipy.ndimage import gaussian_filter as cupy_gaussian_filter
+    HAS_CUPY = False
+
+from scipy.ndimage import gaussian_filter as scipy_gaussian_filter
 
 
 class DetectorMaterial:
-    def __init__(self, name, density_g_cm3, mu_rho_table_cm2_g):
+    """Represents detector scintillator material and attenuation properties."""
+
+    def __init__(self, name: str, density_g_cm3: float, mu_rho_table_cm2_g: Dict[float, float]):
         self.name = name
-        self.density_g_cm3 = density_g_cm3
-        self.mu_rho_table_cm2_g = mu_rho_table_cm2_g
+        self.density_g_cm3 = float(density_g_cm3)
+        self.mu_rho_table_cm2_g = {float(k): float(v) for k, v in mu_rho_table_cm2_g.items()}
+        self._energies = np.array(list(self.mu_rho_table_cm2_g.keys()), dtype=float)
+        self._mu_rho = np.array(list(self.mu_rho_table_cm2_g.values()), dtype=float)
 
-    def mass_attenuation_coefficient(self, energy_keV):
-        energies = np.array(list(self.mu_rho_table_cm2_g.keys()), dtype=float)
-        mu_rho_values = np.array(list(self.mu_rho_table_cm2_g.values()), dtype=float)
-        return np.interp(energy_keV, energies, mu_rho_values)
+    def mass_attenuation_coefficient(self, energy_keV: float) -> float:
+        return float(np.interp(energy_keV, self._energies, self._mu_rho))
 
-    def linear_attenuation_coefficient(self, energy_keV):
+    def linear_attenuation_coefficient(self, energy_keV: float) -> float:
+        """Returns linear attenuation coefficient in cm^-1."""
         return self.mass_attenuation_coefficient(energy_keV) * self.density_g_cm3
 
 
-MATERIALS = {
-    "CsI": DetectorMaterial("Cesium Iodide", 4.51,
-        {20: 5.4, 30: 2.2, 40: 1.6, 50: 1.1, 60: 0.65, 80: 0.36, 100: 0.26, 120: 0.20, 140: 0.17}),
-    "GOS": DetectorMaterial("Gadolinium Oxysulfide", 7.34,
-        {20: 8.5, 30: 3.4, 40: 2.5, 50: 1.6, 60: 1.0, 80: 0.55, 100: 0.40, 120: 0.31, 140: 0.26}),
-    "aSe": DetectorMaterial("Amorphous Selenium", 4.28,
-        {20: 3.1, 30: 1.2, 40: 0.9, 50: 0.55, 60: 0.38, 80: 0.24, 100: 0.18, 120: 0.14, 140: 0.12}),
-    "CdTe": DetectorMaterial("Cadmium Telluride", 5.85,
-        {20: 13.0, 30: 5.5, 40: 4.0, 50: 2.5, 60: 1.7, 80: 0.95, 100: 0.68, 120: 0.53, 140: 0.44}),
+MATERIALS: Dict[str, DetectorMaterial] = {
+    "CsI": DetectorMaterial(
+        "Cesium Iodide", 4.51,
+        {20: 5.4, 30: 2.2, 40: 1.6, 50: 1.1, 60: 0.65, 80: 0.36, 100: 0.26, 120: 0.20, 140: 0.17}
+    ),
+    "GOS": DetectorMaterial(
+        "Gadolinium Oxysulfide", 7.34,
+        {20: 8.5, 30: 3.4, 40: 2.5, 50: 1.6, 60: 1.0, 80: 0.55, 100: 0.40, 120: 0.31, 140: 0.26}
+    ),
+    "aSe": DetectorMaterial(
+        "Amorphous Selenium", 4.28,
+        {20: 3.1, 30: 1.2, 40: 0.9, 50: 0.55, 60: 0.38, 80: 0.24, 100: 0.18, 120: 0.14, 140: 0.12}
+    ),
+    "CdTe": DetectorMaterial(
+        "Cadmium Telluride", 5.85,
+        {20: 13.0, 30: 5.5, 40: 4.0, 50: 2.5, 60: 1.7, 80: 0.95, 100: 0.68, 120: 0.53, 140: 0.44}
+    ),
 }
 
-
-DETECTOR_CONFIG = {
+DEFAULT_DETECTOR_CONFIG: Dict[str, Any] = {
     "detector_rows": 64,
     "detector_channels": 888,
     "detector_element_width_mm": 0.625,
@@ -43,236 +83,228 @@ DETECTOR_CONFIG = {
 }
 
 MATERIAL_NAME_MAP = {
-    "scintillator_photodiode": "GOS",
+    "scintillator_photodiode": "CsI",
 }
 
 
 class EnergyIntegratingDetector:
-    def __init__(self, config=DETECTOR_CONFIG, thickness_cm=0.06,
-                 fill_factor=0.8, conversion_gain_e_per_keV=50.0,
-                 electronic_noise_e=500.0, psf_sigma_px=0.8,
-                 gain_nonuniformity_fraction=0.02, dead_pixel_fraction=0.001,
-                 random_seed=42):
-        self.config = config
-        self.rows = config["detector_rows"]
-        self.channels = config["detector_channels"]
-        self.element_width_mm = config["detector_element_width_mm"]
-        self.element_height_mm = config["detector_element_height_mm"]
-        self.array_width_mm = config["detector_width_mm"]
-        self.array_height_mm = config["detector_height_mm"]
-        self.detector_type = config["detector_type"]
-        self.collimation_mm = config["collimation_mm"]
-        material_key = MATERIAL_NAME_MAP.get(config["detector_material"], config["detector_material"])
-        self.material = MATERIALS[material_key]
-        self.thickness_cm = thickness_cm
-        self.pixel_size_mm = self.element_width_mm
-        self.fill_factor = fill_factor
-        self.conversion_gain = conversion_gain_e_per_keV
-        self.electronic_noise_e = electronic_noise_e
-        self.psf_sigma_px = psf_sigma_px
-        self.gain_nonuniformity_fraction = gain_nonuniformity_fraction
-        self.dead_pixel_fraction = dead_pixel_fraction
-        self.rng = np.random.default_rng(random_seed)
+    """
+    GPU-accelerated CT Energy-Integrating Detector (EID) with CsI scintillator physics.
+    """
 
-    def quantum_efficiency(self, energy_keV):
-        mu = self.material.linear_attenuation_coefficient(energy_keV)
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        thickness_cm: float = 0.06,  # 0.6 mm CsI scintillator
+        fill_factor: float = 0.80,
+        conversion_gain_e_per_keV: float = 50.0,
+        electronic_noise_e: float = 500.0,
+        psf_sigma_px: float = 0.8,
+        gain_nonuniformity_fraction: float = 0.02,
+        dead_pixel_fraction: float = 0.001,
+        random_seed: int = 42,
+        use_cupy: bool = True,
+    ):
+        self.config = config or DEFAULT_DETECTOR_CONFIG
+        self.rows = int(self.config.get("detector_rows", 64))
+        self.channels = int(self.config.get("detector_channels", 888))
+        self.element_width_mm = float(self.config.get("detector_element_width_mm", 0.625))
+        self.element_height_mm = float(self.config.get("detector_element_height_mm", 0.625))
+        self.array_width_mm = float(self.config.get("detector_width_mm", 555.0))
+        self.array_height_mm = float(self.config.get("detector_height_mm", 40.0))
+
+        raw_mat = self.config.get("detector_material", "CsI")
+        mat_key = MATERIAL_NAME_MAP.get(raw_mat, raw_mat)
+        self.material = MATERIALS.get(mat_key, MATERIALS["CsI"])
+
+        self.thickness_cm = float(thickness_cm)
+        self.fill_factor = float(fill_factor)
+        self.conversion_gain = float(conversion_gain_e_per_keV)
+        self.electronic_noise_e = float(electronic_noise_e)
+        self.psf_sigma_px = float(psf_sigma_px)
+        self.gain_nonuniformity_fraction = float(gain_nonuniformity_fraction)
+        self.dead_pixel_fraction = float(dead_pixel_fraction)
+
+        self.use_cupy = use_cupy and HAS_CUPY
+        self.xp = cp if self.use_cupy else np
+
+        # Fixed detector calibration maps (PRNU gain map and dead pixel mask)
+        rng_host = np.random.default_rng(random_seed)
+        gain_np = rng_host.normal(1.0, self.gain_nonuniformity_fraction, size=(self.rows, self.channels)).astype(np.float32)
+        dead_np = (rng_host.random((self.rows, self.channels)) > self.dead_pixel_fraction).astype(np.float32)
+
+        if self.use_cupy:
+            self.gain_map = cp.asarray(gain_np)
+            self.dead_pixel_map = cp.asarray(dead_np)
+        else:
+            self.gain_map = gain_np
+            self.dead_pixel_map = dead_np
+
+    @classmethod
+    def from_config_file(cls, json_path: Union[str, pathlib.Path] = "ct_system_output.json", use_cupy: bool = True) -> "EnergyIntegratingDetector":
+        """Initializes detector from system JSON configuration."""
+        path = pathlib.Path(json_path)
+        cfg = DEFAULT_DETECTOR_CONFIG.copy()
+        if path.is_file():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "detector_config" in data:
+                cfg.update(data["detector_config"])
+            elif "3_detector_team" in data:
+                cfg.update(data["3_detector_team"])
+        return cls(config=cfg, use_cupy=use_cupy)
+
+    def quantum_efficiency(self, energy_keV: float) -> float:
+        """
+        Computes quantum detection efficiency eta(E):
+            eta(E) = (1.0 - exp(-mu(E) * thickness)) * fill_factor
+        """
+        mu = self.material.linear_attenuation_coefficient(energy_keV)  # cm^-1
         absorption_fraction = 1.0 - np.exp(-mu * self.thickness_cm)
-        return absorption_fraction * self.fill_factor
+        return float(absorption_fraction * self.fill_factor)
 
-    def apply_spread(self, image):
-        return gaussian_filter(image, sigma=self.psf_sigma_px)
+    def get_quantum_efficiency_table(self, energy_bins_keV: Any) -> Any:
+        """Computes QDE eta(E) array for all energy bins on GPU or CPU."""
+        xp = self.xp
+        if isinstance(energy_bins_keV, cp.ndarray) if HAS_CUPY else False:
+            e_np = cp.asnumpy(energy_bins_keV)
+        else:
+            e_np = np.asarray(energy_bins_keV, dtype=float)
 
-    def generate_gain_map(self, shape):
-        return self.rng.normal(1.0, self.gain_nonuniformity_fraction, size=shape)
+        eta_np = np.array([self.quantum_efficiency(float(e)) for e in e_np], dtype=np.float32)
+        return xp.asarray(eta_np) if self.use_cupy else eta_np
 
-    def generate_dead_pixel_map(self, shape):
-        mask = self.rng.random(shape) > self.dead_pixel_fraction
-        return mask.astype(float)
+    def apply_spread(self, image: Any) -> Any:
+        """Applies 2D Gaussian optical spread (PSF) on GPU or CPU."""
+        if self.psf_sigma_px <= 0:
+            return image
 
-    def mtf(self, spatial_frequency_lp_per_mm):
-        sigma_mm = self.psf_sigma_px * self.pixel_size_mm
-        return np.exp(-2.0 * (np.pi ** 2) * (sigma_mm ** 2) * (spatial_frequency_lp_per_mm ** 2))
+        if image.ndim == 2:
+            # Single view (H, W)
+            if self.use_cupy and HAS_CUPY:
+                return cupy_gaussian_filter(image, sigma=self.psf_sigma_px)
+            return scipy_gaussian_filter(image, sigma=self.psf_sigma_px)
+        elif image.ndim == 3:
+            # Batch of views (B, H, W)
+            if self.use_cupy and HAS_CUPY:
+                return cupy_gaussian_filter(image, sigma=(0, self.psf_sigma_px, self.psf_sigma_px))
+            return scipy_gaussian_filter(image, sigma=(0, self.psf_sigma_px, self.psf_sigma_px))
+        else:
+            raise ValueError(f"Unsupported array shape for optical spread: {image.shape}")
 
-    def dqe(self, spatial_frequency_lp_per_mm, mean_energy_keV, mean_photon_fluence_per_pixel):
-        eta = self.quantum_efficiency(mean_energy_keV)
-        quantum_variance = mean_photon_fluence_per_pixel * eta * (mean_energy_keV ** 2) * (self.conversion_gain ** 2)
-        electronic_variance = self.electronic_noise_e ** 2
-        noise_fraction = quantum_variance / (quantum_variance + electronic_variance)
-        mtf_values = self.mtf(spatial_frequency_lp_per_mm)
-        return eta * noise_fraction * (mtf_values ** 2)
+    def detect(
+        self,
+        photon_fluence_per_bin: Any,
+        energy_bins_keV: Any,
+        add_noise: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Processes transmitted spectral photon fluence into measured detector electronic signal.
 
-    def detect(self, photon_fluence_per_bin, energy_bins_keV):
-        height, width, n_bins = photon_fluence_per_bin.shape
-        signal_energy_keV = np.zeros((height, width))
-        quantum_energy_variance = np.zeros((height, width))
+        Arguments:
+            photon_fluence_per_bin: (B, H, W, N_bins) or (H, W, N_bins) transmitted fluence on GPU
+            energy_bins_keV:        (N_bins,) energy bin centers in keV
+            add_noise:              Whether to inject quantum Poisson & electronic noise
+        Returns:
+            Dictionary containing:
+                - measured_signal_electrons: (B, H, W) or (H, W) realistic measured signal
+                - ideal_signal_electrons:    (B, H, W) or (H, W) noise-free blurred signal
+                - quantum_noise_std:         Standard deviation of quantum noise
+                - gain_map:                  PRNU map
+                - dead_pixel_map:            Defective pixel mask
+        """
+        xp = self.xp
+        is_batched = photon_fluence_per_bin.ndim == 4
+        if not is_batched:
+            # Shape (H, W, N_bins) -> expand to (1, H, W, N_bins)
+            fluence_4d = photon_fluence_per_bin[None, ...]
+        else:
+            fluence_4d = photon_fluence_per_bin
 
-        for bin_index in range(n_bins):
-            energy_keV = energy_bins_keV[bin_index]
-            eta = self.quantum_efficiency(energy_keV)
-            detected_photons = photon_fluence_per_bin[:, :, bin_index] * eta
-            signal_energy_keV += detected_photons * energy_keV
-            quantum_energy_variance += detected_photons * (energy_keV ** 2)
+        B, H, W, N_bins = fluence_4d.shape
 
-        signal_electrons = signal_energy_keV * self.conversion_gain
-        quantum_noise_electrons = np.sqrt(quantum_energy_variance) * self.conversion_gain
+        # 1. Quantum efficiency and energy weighting tensors
+        eta = self.get_quantum_efficiency_table(energy_bins_keV)  # (N_bins,)
+        if not isinstance(energy_bins_keV, xp.ndarray):
+            e_tensor = xp.asarray(energy_bins_keV, dtype=xp.float32)
+        else:
+            e_tensor = energy_bins_keV.astype(xp.float32)
 
+        # Weights mapping photons per bin to signal electrons and noise variance:
+        # S(E) = Phi(E) * eta(E) * E * G_conv
+        # Var(E) = Phi(E) * eta(E) * E^2 * G_conv^2
+        w_signal = (eta * e_tensor * self.conversion_gain).reshape(1, 1, 1, N_bins)
+        w_var    = (eta * (e_tensor**2) * (self.conversion_gain**2)).reshape(1, 1, 1, N_bins)
+
+        # 2. Integrate across energy bins: (B, H, W)
+        signal_electrons = xp.sum(fluence_4d * w_signal, axis=-1)
+        quantum_var = xp.sum(fluence_4d * w_var, axis=-1)
+        quantum_std = xp.sqrt(xp.maximum(quantum_var, 1e-12))
+
+        # 3. Apply scintillator optical spread (PSF)
         signal_blurred = self.apply_spread(signal_electrons)
-        quantum_noise_blurred = self.apply_spread(quantum_noise_electrons)
+        quantum_std_blurred = self.apply_spread(quantum_std)
 
-        gain_map = self.generate_gain_map((height, width))
-        dead_pixel_map = self.generate_dead_pixel_map((height, width))
+        # 4. Apply PRNU gain variation and dead pixel defects
+        gain = self.gain_map.reshape(1, H, W)
+        dead = self.dead_pixel_map.reshape(1, H, W)
 
-        ideal_signal = signal_blurred * gain_map * dead_pixel_map
+        ideal_signal = signal_blurred * gain * dead
 
-        electronic_noise_sample = self.rng.normal(0.0, self.electronic_noise_e, size=(height, width))
-        quantum_noise_sample = self.rng.normal(0.0, 1.0, size=(height, width)) * quantum_noise_blurred
+        if add_noise:
+            # Gaussian electronic readout noise
+            elec_noise = xp.random.normal(0.0, self.electronic_noise_e, size=ideal_signal.shape, dtype=xp.float32)
+            # Poisson quantum noise realization
+            quant_noise = xp.random.normal(0.0, 1.0, size=ideal_signal.shape, dtype=xp.float32) * quantum_std_blurred
 
-        measured_signal = ideal_signal + quantum_noise_sample + electronic_noise_sample
-        measured_signal = measured_signal * dead_pixel_map
+            measured_signal = (ideal_signal + elec_noise + quant_noise) * dead
+        else:
+            measured_signal = ideal_signal
 
-        total_std = np.sqrt(quantum_noise_blurred ** 2 + self.electronic_noise_e ** 2)
+        if not is_batched:
+            measured_signal = measured_signal[0]
+            ideal_signal = ideal_signal[0]
+            quantum_std_blurred = quantum_std_blurred[0]
 
         return {
-            "measured_signal_electrons": measured_signal,
-            "ideal_signal_electrons": ideal_signal,
-            "quantum_noise_std_electrons": quantum_noise_blurred,
-            "electronic_noise_std_electrons": np.full((height, width), self.electronic_noise_e),
-            "total_std_electrons": total_std,
-            "gain_map": gain_map,
-            "dead_pixel_map": dead_pixel_map,
+            "measured_signal_electrons": measured_signal.astype(xp.float32),
+            "ideal_signal_electrons": ideal_signal.astype(xp.float32),
+            "quantum_noise_std_electrons": quantum_std_blurred.astype(xp.float32),
+            "gain_map": self.gain_map,
+            "dead_pixel_map": self.dead_pixel_map,
         }
 
+    def compute_air_reference_signal(
+        self,
+        incident_fluence_1d: Any,
+        energy_bins_keV: Any,
+    ) -> Any:
+        """
+        Precomputes unattenuated flat-field air reference projection (I_0) for sinogram synthesis.
+        Returns 2D array of shape (H, W) on GPU.
+        """
+        xp = self.xp
+        H, W = self.rows, self.channels
+        N_bins = len(energy_bins_keV)
 
-def generate_synthetic_input(height=64, width=888, energy_bins_keV=(40, 60, 80, 100, 120),
-                              spectrum_weights=(0.35, 0.30, 0.18, 0.10, 0.07),
-                              incident_fluence_per_pixel=2.0e5,
-                              material_thickness_cm=15.0,
-                              mu_water_cm_inv=None):
-    if mu_water_cm_inv is None:
-        mu_water_cm_inv = {40: 0.27, 60: 0.21, 80: 0.18, 100: 0.17, 120: 0.16}
-
-    energy_bins_keV = np.array(energy_bins_keV, dtype=float)
-    weights = np.array(spectrum_weights, dtype=float)
-    weights = weights / weights.sum()
-
-    phantom = np.ones((height, width))
-    phantom[height // 4: 3 * height // 4, width // 4: 3 * width // 4] = 1.35
-
-    photon_fluence_per_bin = np.zeros((height, width, len(energy_bins_keV)))
-    for bin_index, energy_keV in enumerate(energy_bins_keV):
-        mu_water = mu_water_cm_inv[int(energy_keV)]
-        attenuated_fraction = np.exp(-mu_water * material_thickness_cm * phantom)
-        incident_photons = incident_fluence_per_pixel * weights[bin_index]
-        photon_fluence_per_bin[:, :, bin_index] = incident_photons * attenuated_fraction
-
-    return photon_fluence_per_bin, energy_bins_keV
-
-
-def summarize_detector_performance(detector, photon_fluence_per_bin, energy_bins_keV, result):
-    bin_means = [np.mean(photon_fluence_per_bin[:, :, i]) for i in range(len(energy_bins_keV))]
-    mean_energy_keV = np.average(energy_bins_keV, weights=bin_means)
-    mean_fluence_per_pixel = np.sum(photon_fluence_per_bin, axis=2).mean()
-
-    efficiency_by_energy = {int(e): float(detector.quantum_efficiency(e)) for e in energy_bins_keV}
-
-    spatial_frequencies = np.linspace(0.0, 5.0, 50)
-    mtf_curve = detector.mtf(spatial_frequencies)
-    dqe_curve = detector.dqe(spatial_frequencies, mean_energy_keV, mean_fluence_per_pixel)
-
-    summary = {
-        "material": detector.material.name,
-        "thickness_cm": detector.thickness_cm,
-        "efficiency_by_energy_keV": efficiency_by_energy,
-        "mean_quantum_efficiency": float(np.mean(list(efficiency_by_energy.values()))),
-        "psf_sigma_px": detector.psf_sigma_px,
-        "mtf_at_1_lp_mm": float(np.interp(1.0, spatial_frequencies, mtf_curve)),
-        "dqe_at_0_lp_mm": float(dqe_curve[0]),
-        "dqe_at_1_lp_mm": float(np.interp(1.0, spatial_frequencies, dqe_curve)),
-        "electronic_noise_std_e": detector.electronic_noise_e,
-        "mean_quantum_noise_std_e": float(result["quantum_noise_std_electrons"].mean()),
-        "mean_total_std_e": float(result["total_std_electrons"].mean()),
-        "dead_pixel_fraction_actual": float(1.0 - result["dead_pixel_map"].mean()),
-        "gain_nonuniformity_std": float(result["gain_map"].std()),
-        "spatial_frequencies_lp_mm": spatial_frequencies,
-        "mtf_curve": mtf_curve,
-        "dqe_curve": dqe_curve,
-        "detector_rows": detector.rows,
-        "detector_channels": detector.channels,
-        "element_width_mm": detector.element_width_mm,
-        "element_height_mm": detector.element_height_mm,
-        "array_width_mm": detector.array_width_mm,
-        "array_height_mm": detector.array_height_mm,
-        "collimation_mm": detector.collimation_mm,
-        "detector_type": detector.detector_type,
-    }
-    return summary
-
-
-def plot_results(result, summary, save_path="detector_output.png"):
-    fig, axes = plt.subplots(2, 3, figsize=(18, 8))
-
-    axes[0, 0].imshow(result["ideal_signal_electrons"], cmap="gray", aspect="auto")
-    axes[0, 0].set_title("Ideal Signal (electrons)")
-
-    axes[0, 1].imshow(result["measured_signal_electrons"], cmap="gray", aspect="auto")
-    axes[0, 1].set_title("Measured Signal with Noise")
-
-    axes[0, 2].imshow(result["gain_map"], cmap="viridis", aspect="auto")
-    axes[0, 2].set_title("Gain Nonuniformity Map")
-
-    axes[1, 0].imshow(result["dead_pixel_map"], cmap="gray", aspect="auto")
-    axes[1, 0].set_title("Dead Pixel Map")
-
-    axes[1, 1].plot(summary["spatial_frequencies_lp_mm"], summary["mtf_curve"])
-    axes[1, 1].set_title("MTF vs Spatial Frequency")
-    axes[1, 1].set_xlabel("lp/mm")
-    axes[1, 1].set_ylabel("MTF")
-
-    axes[1, 2].plot(summary["spatial_frequencies_lp_mm"], summary["dqe_curve"])
-    axes[1, 2].set_title("DQE vs Spatial Frequency")
-    axes[1, 2].set_xlabel("lp/mm")
-    axes[1, 2].set_ylabel("DQE")
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=130)
-    plt.close(fig)
+        # Broadcast nominal unattenuated fluence: (1, H, W, N_bins)
+        inc_4d = xp.broadcast_to(incident_fluence_1d.reshape(1, 1, 1, N_bins), (1, H, W, N_bins))
+        res = self.detect(inc_4d, energy_bins_keV, add_noise=False)
+        return res["ideal_signal_electrons"][0]
 
 
 if __name__ == "__main__":
-    detector = EnergyIntegratingDetector(
-        config=DETECTOR_CONFIG,
-        thickness_cm=0.06,
-        fill_factor=0.8,
-        conversion_gain_e_per_keV=50.0,
-        electronic_noise_e=500.0,
-        psf_sigma_px=0.8,
-        gain_nonuniformity_fraction=0.02,
-        dead_pixel_fraction=0.001,
-    )
+    det = EnergyIntegratingDetector.from_config_file("ct_system_output.json", use_cupy=True)
+    print(f"EnergyIntegratingDetector initialized: {det.rows} rows x {det.channels} channels")
+    print(f"Material: {det.material.name} (Density: {det.material.density_g_cm3} g/cm3, Thickness: {det.thickness_cm*10:.2f} mm)")
+    print(f"Fill factor: {det.fill_factor:.2f} | Conversion Gain: {det.conversion_gain} e-/keV | Elec Noise: {det.electronic_noise_e} e-")
+    
+    e_test = cp.arange(10.0, 121.0, 1.0, dtype=cp.float32)
+    qde_60 = det.quantum_efficiency(60.0)
+    print(f"QDE at 60 keV: {qde_60 * 100:.2f}%")
 
-    photon_fluence_per_bin, energy_bins_keV = generate_synthetic_input(
-        height=detector.rows, width=detector.channels
-    )
-
-    result = detector.detect(photon_fluence_per_bin, energy_bins_keV)
-    summary = summarize_detector_performance(detector, photon_fluence_per_bin, energy_bins_keV, result)
-
-    print("Detector Type:", summary["detector_type"])
-    print("Detector Rows x Channels:", summary["detector_rows"], "x", summary["detector_channels"])
-    print("Element Size (mm):", summary["element_width_mm"], "x", summary["element_height_mm"])
-    print("Array Size (mm):", summary["array_width_mm"], "x", summary["array_height_mm"])
-    print("Collimation (mm):", summary["collimation_mm"])
-    print("Detector Material:", summary["material"], "Thickness (cm):", summary["thickness_cm"])
-    print("Quantum Efficiency by Energy (keV -> eta):", summary["efficiency_by_energy_keV"])
-    print("Mean Quantum Efficiency:", round(summary["mean_quantum_efficiency"], 4))
-    print("PSF Sigma (pixels):", summary["psf_sigma_px"])
-    print("MTF at 1 lp/mm:", round(summary["mtf_at_1_lp_mm"], 4))
-    print("DQE at 0 lp/mm:", round(summary["dqe_at_0_lp_mm"], 4))
-    print("DQE at 1 lp/mm:", round(summary["dqe_at_1_lp_mm"], 4))
-    print("Electronic Noise Std (electrons):", summary["electronic_noise_std_e"])
-    print("Mean Quantum Noise Std (electrons):", round(summary["mean_quantum_noise_std_e"], 2))
-    print("Mean Total Noise Std (electrons):", round(summary["mean_total_std_e"], 2))
-    print("Actual Dead Pixel Fraction:", round(summary["dead_pixel_fraction_actual"], 5))
-    print("Gain Nonuniformity Std:", round(summary["gain_nonuniformity_std"], 4))
-
-    plot_results(result, summary, save_path="C:\\Users\\Saksham Chhapane\\Downloads\\CT\\detector_output.png")
+    # Test single-view detection
+    fake_fluence = cp.ones((det.rows, det.channels, len(e_test)), dtype=cp.float32) * 200.0
+    out = det.detect(fake_fluence, e_test, add_noise=True)
+    sig = out["measured_signal_electrons"]
+    print(f"Output signal shape: {sig.shape} (Type: {type(sig)}) | Mean Signal: {float(sig.mean()):.1f} e-")
